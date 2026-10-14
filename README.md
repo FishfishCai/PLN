@@ -1,6 +1,7 @@
 # PolarLiteNet (PLN)
 
-Code for **_Lightweight Neural Decoding for Robust Spectral–Polarization Reconstruction_**.
+Code for **_Single-Pass Neural Inversion of a Weak Difference Signal for Chip-Scale
+Spectropolarimetry_**.
 
 PolarLiteNet is a lightweight neural decoder that reconstructs the spectral power $S_0(\lambda)$ and the normalized Stokes parameter $S_1'(\lambda) = S_1/S_0$ of a partially polarized spectrum from the two signal arrays $I_x$ and $I_y$ produced by a polarization-sensitive nanostructural encoder of orthogonal elliptical nanopillar photodiodes. The two arrays are log min-max normalized jointly, so their ratio, which carries the polarization information, reaches the network intact. The network couples two fully connected blocks and a 1-D convolutional block through a residual connection and outputs $S_0$ and $S_1'$ jointly in a single forward pass. It is trained entirely on device-informed simulated spectra with randomized Lorentzian peak parameters and wavelength-dependent polarization angles, optionally augmented with response and measurement noise.
 
