@@ -1,0 +1,37 @@
+{
+  "model_path": "nnls/modeling/y0p1.json",
+  "save_dir": "nnls/ckpts/y0p1",
+  "r_path": "data/responsivity/r.txt",
+  "n_wavelengths": 151,
+  "max_n_peaks": 1,
+  "width_range": [
+    10.0,
+    25.0
+  ],
+  "magnitude_range": [
+    0.6,
+    1.4
+  ],
+  "peak_range": [
+    25,
+    125
+  ],
+  "min_dist": 15,
+  "polarization_range": [
+    -1.5707963267948966,
+    1.5707963267948966
+  ],
+  "r_noise": 0.0,
+  "x_noise": 0.0,
+  "y_noise": 0.001,
+  "seed": 42,
+  "batch_size": 1024,
+  "grid_log10_min": 3,
+  "grid_log10_max": 12,
+  "grid_size": 500,
+  "test_seed": 42,
+  "test_batch_size": 1024,
+  "test_r_noise": 0.0,
+  "test_x_noise": 0.0,
+  "test_y_noise": 0.001
+}

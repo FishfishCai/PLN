@@ -1,0 +1,24 @@
+# file not needed
+data/*/
+!data/responsivity/
+ckpts/
+
+# macOS System
+.DS_Store
+
+# Python cache
+__pycache__/
+
+# Python environment
+.venv/
+
+# ai
+.claude/
+.agents
+
+# IDE
+.vscode/
+.idea/
+
+# post-processing figures and notebooks
+plot/

@@ -1,0 +1,50 @@
+{
+  "model_path": "pln/modeling/residual_off_512.json",
+  "save_dir": "pln/ckpts/residual_off_512_s46",
+  "r_path": "data/responsivity/r.txt",
+  "n_wavelengths": 151,
+  "max_n_peaks": 1,
+  "width_range": [
+    10.0,
+    25.0
+  ],
+  "magnitude_range": [
+    0.6,
+    1.4
+  ],
+  "peak_range": [
+    25,
+    125
+  ],
+  "min_dist": 15,
+  "polarization_range": [
+    -1.5707963267948966,
+    1.5707963267948966
+  ],
+  "r_noise": 0.0,
+  "x_noise": 0.0,
+  "y_noise": 0.0,
+  "train_cpu": false,
+  "mixed_precision": "no",
+  "batch_size": 256,
+  "eval_batch_size": 1024,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.0,
+  "max_steps": 100000,
+  "grad_clip_norm": null,
+  "seed": 46,
+  "deterministic": false,
+  "compile_model": false,
+  "verbose": true,
+  "save_logs": true,
+  "log_interval": 100,
+  "eval_interval": 2000,
+  "save_interval": 10000,
+  "test_checkpoint": "pln/ckpts/residual_off_512_s46/best_model.pth",
+  "test_cpu": true,
+  "test_seed": 42,
+  "test_batch_size": 1024,
+  "test_r_noise": 0.0,
+  "test_x_noise": 0.0,
+  "test_y_noise": 0.0
+}

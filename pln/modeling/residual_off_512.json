@@ -1,0 +1,21 @@
+{
+  "y_dim": 72,
+  "x_dim": 302,
+  "rec_hidden": [
+    512,
+    256
+  ],
+  "conv_channels": [
+    8,
+    16,
+    32
+  ],
+  "fc_hidden": [
+    512,
+    256
+  ],
+  "use_cnn": true,
+  "use_skip": false,
+  "separate_heads": false,
+  "dropout": 0.25
+}
