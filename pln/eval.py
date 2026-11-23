@@ -17,7 +17,7 @@ def main(
 ) -> None:
     args = load_args(config_path)
     trainer = Trainer(
-        model_class=PLNModel,
+        model_class={"pln": PLNModel},
         config_path=args.test_checkpoint,
         save_dir=args.save_dir,
         accelerator=Accelerator(cpu=args.test_cpu, mixed_precision=args.mixed_precision),
@@ -28,9 +28,9 @@ def main(
         save_logs=args.save_logs,
     )
     results = trainer.evaluate(
-        build_test_loaders(args, trainer.device),
-        {"test": {"xmse": XMSEMetric(), "roi": ROIMetric(args.n_wavelengths)}},
-        eval_step,
+        eval_step={"test": eval_step},
+        eval_loaders=build_test_loaders(args, trainer.device),
+        eval_metrics={"test": {"xmse": XMSEMetric(), "roi": ROIMetric(args.n_wavelengths)}},
     )
     Path(args.save_dir, "test.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 

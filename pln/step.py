@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
 from torch import nn
@@ -43,34 +43,37 @@ def _network_input(
 
 
 def train_step(
-    model: nn.Module,
+    models: Dict[str, nn.Module],
     batch: Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
+    update: Callable[..., None],
 ) -> Dict[str, torch.Tensor]:
     """
-    Run one training forward pass with the summed squared-error loss.
+    Run one training iteration, a single update with the summed squared-error loss.
 
     Parameters
     ----------
-    model : nn.Module
-        PolarLiteNet in training mode.
+    models : Dict[str, nn.Module]
+        ``{"pln"}``, PolarLiteNet in training mode.
     batch : Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
         ``({"i_x", "i_y"}, {"x"})`` pair produced by the loader.
+    update : Callable[..., None]
+        ``Trainer.update``, which takes the scalar loss and applies it.
 
     Returns
     -------
     result : Dict[str, torch.Tensor]
-        ``"loss"`` for the backward pass plus the detached ``"x_pred"`` and the target
-        ``"x"`` for the training metrics.
+        Detached ``"x_pred"`` and the target ``"x"`` for the training metrics.
     """
     inputs, gts = batch
-    x_pred = model(_network_input(inputs))["x_pred"]
-    return {"loss": _XMSE(x_pred, gts["x"]), "x_pred": x_pred.detach(), "x": gts["x"]}
+    x_pred = models["pln"](_network_input(inputs))["x_pred"]
+    update(_XMSE(x_pred, gts["x"]))
+    return {"x_pred": x_pred.detach(), "x": gts["x"]}
 
 
 def eval_step(
-    model: nn.Module,
+    models: Dict[str, nn.Module],
     batch: Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
 ) -> Dict[str, torch.Tensor]:
     """Run one evaluation forward pass on a ``({"i_x", "i_y"}, {"x"})`` batch and return ``"x_pred"`` with its target ``"x"``."""
     inputs, gts = batch
-    return {"x_pred": model(_network_input(inputs))["x_pred"], "x": gts["x"]}
+    return {"x_pred": models["pln"](_network_input(inputs))["x_pred"], "x": gts["x"]}

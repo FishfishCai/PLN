@@ -448,7 +448,7 @@ def build_train_loaders(
     train_loader : SimulatedBatches
         Training iterable, one fresh batch per pass.
     eval_loaders : Dict[str, SimulatedBatches]
-        ``{"eval": loader}`` used for best-model selection.
+        ``{"eval": loader}``, the validation loader evaluated during training.
     """
     settings = _simulation_settings(args, device)
     noise = dict(r_noise=args.r_noise, x_noise=args.x_noise, y_noise=args.y_noise)

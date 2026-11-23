@@ -1,6 +1,6 @@
 import inspect
 import torch.nn as nn
-from typing import Any
+from typing import Any, Dict, Tuple
 
 
 class BaseModel(nn.Module):
@@ -52,3 +52,7 @@ class BaseModel(nn.Module):
             if name != self_param.name
         }
         return instance
+
+    def __getnewargs_ex__(self) -> Tuple[tuple, Dict[str, Any]]:
+        """Hand the recorded constructor arguments to ``__new__`` when the model is copied or unpickled."""
+        return (), self.config

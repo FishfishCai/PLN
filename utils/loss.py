@@ -14,7 +14,7 @@ class Metric(Protocol):
         self,
         **kwargs: Any,
     ) -> None:
-        """Accumulate one batch, receiving the step function's dict minus ``"loss"`` as keyword arguments."""
+        """Accumulate one batch, receiving the step function's dict as keyword arguments."""
         ...
 
     def compute(self) -> Union[torch.Tensor, float, Dict[str, float]]:

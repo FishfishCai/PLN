@@ -33,7 +33,7 @@ Install the environment with `uv sync`; every entry point reads one JSON run fil
 
 ```bash
 python -m pln.train pln/training/<run>.json     # train one PolarLiteNet run, from the repository root
-python -m pln.eval pln/training/<run>.json      # evaluate its best checkpoint on the seeded test set
+python -m pln.eval pln/training/<run>.json      # evaluate its test checkpoint on the seeded test set
 python -m nnls.train nnls/training/<run>.json   # tune the LS+TV weights at one noise level
 python -m nnls.eval nnls/training/<run>.json    # run LS+TV on that noise level's test set
 ```

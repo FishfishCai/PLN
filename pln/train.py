@@ -17,15 +17,17 @@ def main(
 ) -> None:
     args = load_args(config_path)
     trainer = Trainer(
-        model_class=PLNModel,
+        model_class={"pln": PLNModel},
         config_path=args.model_path,
         save_dir=args.save_dir,
-        optimizer=lambda model: AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        ),
-        scheduler=lambda optimizer: CosineAnnealingLR(optimizer, T_max=args.max_steps),
+        optimizer=lambda models: {
+            "pln": AdamW(
+                models["pln"].parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+            ),
+        },
+        scheduler=lambda optimizers: {"pln": CosineAnnealingLR(optimizers["pln"], T_max=args.max_steps)},
         accelerator=Accelerator(cpu=args.train_cpu, mixed_precision=args.mixed_precision),
         grad_clip_norm=args.grad_clip_norm,
         seed=args.seed,
@@ -35,12 +37,12 @@ def main(
         save_logs=args.save_logs,
     )
     train_loader, eval_loaders = build_train_loaders(args, trainer.device)
-    trainer.train_with_eval(
+    trainer.train(
         max_steps=args.max_steps,
         train_step=train_step,
         train_loader=train_loader,
         train_metrics={"xmse": XMSEMetric()},
-        eval_step=eval_step,
+        eval_step={"eval": eval_step},
         eval_loaders=eval_loaders,
         eval_metrics={"eval": {"xmse": XMSEMetric(), "roi": ROIMetric(args.n_wavelengths)}},
         log_interval=args.log_interval,

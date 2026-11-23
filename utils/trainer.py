@@ -3,18 +3,18 @@ import sys
 import torch
 from accelerate import Accelerator
 from accelerate.utils import broadcast, set_seed
-from itertools import chain, repeat
 from pathlib import Path
 from timeit import default_timer
 from torch import nn
 from torch.utils.data import DataLoader
-from typing import Any, Callable, Dict, Iterable, Type, Union
+from typing import Any, Callable, Dict, Iterable, Sequence, Set, Tuple, Type, Union
 
 from .base_model import BaseModel
 from .loss import Metric
 
 
-StepFn = Callable[[nn.Module, Any], Dict[str, Any]]
+TrainStepFn = Callable[[Dict[str, nn.Module], Any, Callable[..., None]], Dict[str, Any]]
+EvalStepFn = Callable[[Dict[str, nn.Module], Any], Dict[str, Any]]
 
 
 def to_device(
@@ -38,13 +38,14 @@ def to_device(
         New structure of the same shape with every tensor placed on ``device``.
     """
     if torch.is_tensor(obj):
-        return obj.to(device, non_blocking=True)
+        return obj.to(device, non_blocking=obj.is_pinned())
     if isinstance(obj, dict):
         return {key: to_device(value, device) for key, value in obj.items()}
     if isinstance(obj, list):
         return [to_device(value, device) for value in obj]
     if isinstance(obj, tuple):
-        return tuple(to_device(value, device) for value in obj)
+        moved = [to_device(value, device) for value in obj]
+        return type(obj)(*moved) if hasattr(obj, "_fields") else tuple(moved)
     return obj
 
 
@@ -73,19 +74,19 @@ def scalar(
 
 
 class Trainer:
-    """Step-based trainer that builds a model from a config or checkpoint and drives training and evaluation."""
+    """Step-based trainer that builds named models from a config or checkpoint and drives training and evaluation."""
 
     def __init__(
         self,
         *,
-        model_class: Type[BaseModel],
+        model_class: Dict[str, Type[BaseModel]],
         config_path: Union[str, Path],
         save_dir: Union[Path, str],
-        optimizer: Callable[[nn.Module], torch.optim.Optimizer] | None = None,
-        scheduler: Callable[[torch.optim.Optimizer], object] | None = None,
+        optimizer: Callable[[Dict[str, nn.Module]], Dict[str, torch.optim.Optimizer]] | None = None,
+        scheduler: Callable[[Dict[str, torch.optim.Optimizer]], Dict[str, object]] | None = None,
         accelerator: Accelerator | None = None,
-        grad_clip_norm: float | None = None,
-        ema_decay: float | None = None,
+        grad_clip_norm: Dict[str, float] | None = None,
+        ema_decay: Dict[str, float] | None = None,
         seed: int = 0,
         deterministic: bool = False,
         compile_model: bool = False,
@@ -93,37 +94,43 @@ class Trainer:
         save_logs: bool = True,
     ) -> None:
         """
-        Build the model, optimizer, scheduler, and moving average, restoring training state
-        from a checkpoint.
+        Build the named models, optimizers, schedulers, and moving averages.
 
         The file extension of ``config_path`` decides the mode: a ``.json`` file starts a
-        fresh run from its hyper-parameters, a ``.pth`` checkpoint resumes model weights,
-        optimizer, scheduler, step counter, and best metric value.
+        fresh run, a ``.pth`` checkpoint resumes every model, optimizer, scheduler, and the
+        step counter.
 
         Parameters
         ----------
-        model_class : Type[BaseModel]
-            Class used to build the model, which must subclass ``BaseModel``.
+        model_class : Dict[str, Type[BaseModel]]
+            Class of each named model, which must subclass ``BaseModel``.
         config_path : Union[str, Path]
-            Path to a ``.json`` hyper-parameter file or a ``.pth`` checkpoint.
+            Path to a ``.json`` hyper-parameter file or a ``.pth`` checkpoint. The ``.json``
+            file maps each model name to the keyword arguments of its class, or to a string
+            ``"<checkpoint>.pth:<name>"`` that takes that model from another checkpoint.
         save_dir : Union[Path, str]
             Directory that receives checkpoints and ``logs.txt``.
-        optimizer : Callable[[nn.Module], torch.optim.Optimizer] | None
-            Factory that builds the optimizer from the model. Training is unavailable when
-            omitted, which is the evaluation-only mode. Default is None.
-        scheduler : Callable[[torch.optim.Optimizer], object] | None
-            Factory that builds the learning-rate scheduler from the optimizer. It is
-            stepped once per optimizer update. Default is None.
+        optimizer : Callable[[Dict[str, nn.Module]], Dict[str, torch.optim.Optimizer]] | None
+            Factory that builds the named optimizers from the named models. A parameter in
+            no optimizer takes no gradient, and a model with no such parameter at all is
+            frozen, in evaluation mode.
+            Training is unavailable when omitted, which is the evaluation-only mode.
+            Default is None.
+        scheduler : Callable[[Dict[str, torch.optim.Optimizer]], Dict[str, object]] | None
+            Factory that builds learning-rate schedulers from the named optimizers, each
+            under the name of the optimizer it follows and stepped once per update of that
+            optimizer. Default is None.
         accelerator : Accelerator | None
-            Accelerator carrying the device, mixed-precision, and gradient-accumulation
-            settings. A default one is created when omitted. Default is None.
-        grad_clip_norm : float | None
-            Maximum gradient norm applied before each optimizer update. No clipping when
-            omitted. Default is None.
-        ema_decay : float | None
-            Decay of the exponential moving average of the weights that evaluation uses,
-            updated after each optimizer update and stored in checkpoints. No average when
-            omitted. Default is None.
+            Accelerator carrying the device and mixed-precision settings. A default one
+            is created when omitted. Default is None.
+        grad_clip_norm : Dict[str, float] | None
+            Maximum gradient norm per optimizer name, applied to the parameters of that
+            optimizer before each of its updates. Optimizers left out are not clipped.
+            Default is None.
+        ema_decay : Dict[str, float] | None
+            Decay per model name of the exponential moving average of its weights, updated
+            after each step that updates the model, stored in checkpoints, and used
+            for evaluation. Models left out keep no average. Default is None.
         seed : int
             Base seed for Python, NumPy, and torch. Each process is offset by its rank so
             that data augmentation differs across ranks. Default is 0.
@@ -131,7 +138,7 @@ class Trainer:
             Whether to request deterministic algorithms, which can slow training down.
             Default is False.
         compile_model : bool
-            Whether to wrap the model with ``torch.compile``. Default is False.
+            Whether to wrap every model with ``torch.compile``. Default is False.
         verbose : bool
             Whether the main process prints progress. Default is True.
         save_logs : bool
@@ -140,12 +147,12 @@ class Trainer:
         self.accelerator = accelerator if accelerator is not None else Accelerator()
         self.device = self.accelerator.device
         self._is_main = self.accelerator.is_main_process
-        self.grad_clip_norm = grad_clip_norm
-        self.ema_decay = ema_decay
-        set_seed(seed, device_specific=True, deterministic=deterministic)
+        self.grad_clip_norm = grad_clip_norm or {}
+        self.ema_decay = ema_decay or {}
+        # Every process builds from the same seed, so the models and their averages start identical.
+        set_seed(seed, deterministic=deterministic)
 
         self.step = 0
-        self.best_metric_value = float("inf")
 
         self.verbose = verbose and self._is_main
         self.save_logs = save_logs and self._is_main
@@ -156,46 +163,69 @@ class Trainer:
         if self.save_logs:
             self.log_path.touch()
 
-        # Order is forced: optimizer needs the model, resume needs both before prepare.
-        ckpt = self._build_model(config_path, model_class)
-        built_optimizer = optimizer(self.model) if optimizer is not None else None
-        built_scheduler = (
-            scheduler(built_optimizer)
-            if (scheduler is not None and built_optimizer is not None)
-            else None
-        )
+        self._modules, ckpt = self._build_models(config_path, model_class, optimizer is not None)
+        self.optimizers = optimizer(self._modules) if optimizer is not None else {}
+        self.schedulers = scheduler(self.optimizers) if scheduler is not None else {}
+        self._check("scheduler", self.schedulers, "optimizer", self.optimizers)
+        self._check("grad_clip_norm", self.grad_clip_norm, "optimizer", self.optimizers)
+        self._params = {
+            name: [
+                param
+                for group in built.param_groups
+                for param in group["params"]
+                if param.requires_grad
+            ]
+            for name, built in self.optimizers.items()
+        }
+        held = {name: {id(param) for param in params} for name, params in self._params.items()}
+        self._owners = {
+            name: {
+                optimizer_name
+                for optimizer_name, ids in held.items()
+                if any(id(param) in ids for param in module.parameters())
+            }
+            for name, module in self._modules.items()
+        }
+        self._frozen = {name for name, owners in self._owners.items() if not owners}
+        trained = set().union(*held.values())
+        for module in self._modules.values():
+            for param in module.parameters():
+                if id(param) not in trained:
+                    param.requires_grad_(False)
         if ckpt is not None:
-            self._resume_state(ckpt, built_optimizer, built_scheduler)
-        if compile_model:
-            self.model = torch.compile(self.model)
+            self._resume_state(ckpt)
+        self._ema_modules = self._build_ema(ckpt, model_class)
 
-        self.model = self.accelerator.prepare(self.model)
-        self.optimizer = (
-            self.accelerator.prepare(built_optimizer)
-            if built_optimizer is not None
-            else None
-        )
-        self.scheduler = (
-            self.accelerator.prepare(built_scheduler)
-            if built_scheduler is not None
-            else None
-        )
-        self.ema_model = (
-            self._prepare_ema(ckpt, compile_model)
-            if ema_decay is not None
-            else None
-        )
+        self.models = {
+            name: self.accelerator.prepare_model(
+                torch.compile(module) if compile_model else module,
+                evaluation_mode=name in self._frozen,
+            )
+            for name, module in self._modules.items()
+        }
+        self.ema_models = {}
+        for name, module in self._ema_modules.items():
+            ema = self.accelerator.prepare_model(module, evaluation_mode=True)
+            self.ema_models[name] = torch.compile(ema) if compile_model else ema
+
+        self._loaders: Dict[DataLoader, DataLoader] = {}
+        self._stepped: Set[str] = set()
+        self._pending: Dict[str, Tuple[Any, int]] = {}
+        self._window_loss: Dict[str, Any] = {}
+        self._window_updates: Dict[str, int] = {}
+        self._train_mode()
+
         # Reseed from the resume point once everything is built, so a run never replays past draws.
         set_seed(seed + self.step, device_specific=True, deterministic=deterministic)
 
-    def train_with_eval(
+    def train(
         self,
         *,
         max_steps: int,
-        train_step: StepFn,
+        train_step: TrainStepFn,
         train_loader: Iterable[Any],
         train_metrics: Dict[str, Metric] | None = None,
-        eval_step: Union[StepFn, Dict[str, StepFn]] | None = None,
+        eval_step: Dict[str, EvalStepFn] | None = None,
         eval_loaders: Dict[str, Iterable[Any]] | None = None,
         eval_metrics: Dict[str, Dict[str, Metric]] | None = None,
         log_interval: int = 100,
@@ -203,29 +233,28 @@ class Trainer:
         save_interval: int = 1000,
     ) -> None:
         """
-        Train until ``max_steps`` optimizer updates, logging, evaluating, and saving on schedule.
+        Train until ``max_steps`` steps, logging, evaluating, and saving on schedule.
 
-        A step is one optimizer update, and each of the three intervals also fires on the
-        final step. ``best_model.pth`` tracks the first metric of the first evaluation
-        loader, lower being better, and a non-finite loss or gradient norm raises before
-        it reaches the weights.
+        A step is one call of ``train_step``, or as many calls as it takes to apply every
+        gradient they accumulate, one batch per call. Each of the three intervals also fires on the
+        final step.
 
         Parameters
         ----------
         max_steps : int
             Global step at which training stops, counted from zero across resumes.
-        train_step : StepFn
-            Callable receiving the model and one batch and returning a dict that must hold
-            a ``"loss"`` entry with a scalar tensor. The remaining entries are forwarded to
-            ``train_metrics``.
+        train_step : TrainStepFn
+            Callable receiving the named models, one batch, and ``Trainer.update``. It
+            computes each loss and passes it to ``update`` in the order the step
+            requires, then returns a dict forwarded to ``train_metrics``.
         train_loader : Iterable[Any]
-            Any iterable of batches. A finite one restarts automatically when exhausted.
+            Any iterable of batches. A finite one is iterated again when exhausted, so it
+            must not be a one-shot iterator.
         train_metrics : Dict[str, Metric] | None
             Metrics recorded per logging window and reset afterwards. Default is None.
-        eval_step : Union[StepFn, Dict[str, StepFn]] | None
-            Callable receiving the model and one batch and returning a dict forwarded to
-            the metrics of that loader, or a mapping from loader name to such a callable.
-            Required when ``eval_loaders`` is given. Default is None.
+        eval_step : Dict[str, EvalStepFn] | None
+            Callable per evaluation loader, receiving the named models and one batch and
+            returning a dict forwarded to the metrics of that loader. Default is None.
         eval_loaders : Dict[str, Iterable[Any]] | None
             Named evaluation sets, each of which must be finite. Default is None.
         eval_metrics : Dict[str, Dict[str, Metric]] | None
@@ -238,11 +267,12 @@ class Trainer:
         save_interval : int
             Number of steps between checkpoints. Default is 1000.
         """
-        if self.optimizer is None:
+        if not self.optimizers:
             raise ValueError(
-                "Training requires an optimizer. Pass optimizer=... at construction."
+                "Training requires optimizers. Pass optimizer=... at construction."
             )
         train_metrics = train_metrics or {}
+        eval_step = eval_step or {}
         eval_loaders = eval_loaders or {}
         eval_metrics = eval_metrics or {}
 
@@ -254,18 +284,12 @@ class Trainer:
         ):
             if value < 1:
                 raise ValueError(f"{name} must be positive, got {value}.")
-        missing = sorted(set(eval_loaders) - set(eval_metrics))
-        if missing:
-            raise ValueError(
-                f"eval_metrics has no entry for eval_loaders {missing}. It must be "
-                "{loader_name: {metric_name: metric}}."
-            )
-        if eval_loaders and eval_step is None:
-            raise ValueError("eval_loaders were given but eval_step is None.")
+        self._check("eval_loaders", eval_loaders, "eval_step", eval_step)
+        self._check("eval_loaders", eval_loaders, "eval_metrics", eval_metrics)
 
         message = (
             f"Training from step {self.step} to {max_steps} on {self.device}"
-            f" (accumulate={self.accelerator.gradient_accumulation_steps},"
+            f" (models={sorted(self.models)}, optimizers={sorted(self.optimizers)},"
             f" processes={self.accelerator.num_processes})"
         )
         if eval_loaders:
@@ -274,139 +298,188 @@ class Trainer:
             print(message)
             sys.stdout.flush()
 
-        if isinstance(train_loader, DataLoader):
-            train_loader = self.accelerator.prepare(train_loader)
-        head = iter(train_loader)
-        first = next(head, None)
-        if first is None:
-            raise ValueError("train_loader yielded no batches, so training cannot start.")
-        batches = chain([first], head, chain.from_iterable(repeat(train_loader)))
+        train_loader = self._prepare_loader(train_loader)
+        batches = iter(train_loader)
 
-        self.model.train()
+        self._train_mode()
         for metric in train_metrics.values():
             metric.reset()
-        window_loss = 0.0
-        window_batches = 0
+        self._window_loss.clear()
+        self._window_updates.clear()
         window_start = default_timer()
 
         while self.step < max_steps:
-            with self.accelerator.accumulate(self.model):
-                result = train_step(self.model, to_device(next(batches), self.device))
-                loss = result.pop("loss")
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(
-                        f"Non-finite loss after {self.step} steps. Stopping before the backward pass."
-                    )
-                self.accelerator.backward(loss)
-                if self.grad_clip_norm is not None and self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(
-                        self.model.parameters(), self.grad_clip_norm
-                    )
-                    if self.accelerator.scaler is None and not torch.isfinite(grad_norm):
-                        raise FloatingPointError(
-                            f"Non-finite gradient norm after {self.step} steps. "
-                            "Stopping before the optimizer update."
-                        )
-                self.optimizer.step()
-                if self.scheduler is not None:
-                    self.scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
+            batch = next(batches, None)
+            if batch is None:
+                batches = iter(train_loader)
+                batch = next(batches, None)
+            if batch is None:
+                raise ValueError(
+                    "train_loader yielded no batches after a restart, so it is empty or a "
+                    "one-shot iterator."
+                )
+            with self.accelerator.autocast():
+                result = train_step(self.models, to_device(batch, self.device), self.update)
             for metric in train_metrics.values():
                 metric.update(**result)
-            window_loss = window_loss + loss.detach()
-            window_batches += 1
-            # Only applied optimizer updates count, not accumulation micro-batches or skipped steps.
-            if (
-                not self.accelerator.sync_gradients
-                or self.accelerator.optimizer_step_was_skipped
-            ):
+            # Gradients still waiting to be applied mean the step continues on the next batch.
+            if self._pending:
                 continue
-            if self.ema_model is not None:
-                self._update_ema()
+            self._update_ema()
             self.step += 1
             last = self.step >= max_steps
 
             if self.step % log_interval == 0 or last:
-                train_loss = float(window_loss / window_batches)
                 self._log({
                     "time": default_timer() - window_start,
-                    "loss": train_loss,
+                    **{
+                        label: float(total / self._window_updates[label])
+                        for label, total in self._window_loss.items()
+                    },
                     "train": {n: scalar(m.compute()) for n, m in train_metrics.items()},
-                    "lr": self.optimizer.param_groups[-1]["lr"],
+                    "lr": {n: o.param_groups[-1]["lr"] for n, o in self.optimizers.items()},
                 })
                 for metric in train_metrics.values():
                     metric.reset()
-                window_loss = 0.0
-                window_batches = 0
+                self._window_loss.clear()
+                self._window_updates.clear()
                 window_start = default_timer()
 
             if eval_loaders and (self.step % eval_interval == 0 or last):
-                eval_results = self.evaluate(eval_loaders, eval_metrics, eval_step)
-                self.model.train()
-                first_results = eval_results[next(iter(eval_loaders))]
-                if first_results:
-                    value = next(iter(first_results.values()))
-                    if value < self.best_metric_value:
-                        self.best_metric_value = float(value)
-                        self._save_state("best_model")
+                self.evaluate(
+                    eval_step=eval_step,
+                    eval_loaders=eval_loaders,
+                    eval_metrics=eval_metrics,
+                )
+                self._train_mode()
 
             if self.step % save_interval == 0 or last:
                 self._save_state(f"step_{self.step}")
 
+    def update(
+        self,
+        loss: torch.Tensor,
+        optimizers: Sequence[str] | None = None,
+        accumulate: int = 1,
+    ) -> None:
+        """
+        Apply one loss to a set of optimizers, the only way a training step changes weights.
+
+        The backward pass reaches only the parameters of those optimizers, which then step
+        once with their schedulers and clear their gradients. A non-finite loss or gradient
+        norm raises before it reaches the weights. Under a gradient scaler, a non-finite
+        gradient instead makes the scaler skip the step, and the schedulers with it.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Scalar loss of this update.
+        optimizers : Sequence[str] | None
+            Names of the optimizers this loss updates, whose parameters must not overlap
+            within one update. All optimizers when omitted. Default is None.
+        accumulate : int
+            Number of calls on the same optimizers that share one update. Each call adds the
+            gradient of ``loss / accumulate``, and the last one applies the sum, which is the
+            mean loss the update logs. The calls may lie in one call of the training step or
+            in consecutive ones, which then form a single step. Default is 1.
+        """
+        names = sorted(self.optimizers if optimizers is None else optimizers)
+        label = "loss" if len(names) == len(self.optimizers) else "loss/" + "+".join(names)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite {label} after {self.step} steps. Stopping before the backward pass."
+            )
+        scaler = self.accelerator.scaler
+        # The step runs under mixed-precision casting, which the backward pass and the updates leave.
+        with torch.autocast(self.device.type, enabled=False):
+            loss = loss / accumulate
+            (loss if scaler is None else scaler.scale(loss)).backward(
+                inputs=[param for name in names for param in self._params[name]]
+            )
+            total, n_calls = self._pending.get(label, (0.0, 0))
+            self._pending[label] = (total + loss.detach(), n_calls + 1)
+            if n_calls + 1 < accumulate:
+                return
+            for name in names:
+                built = self.optimizers[name]
+                max_norm = self.grad_clip_norm.get(name, float("inf"))
+                if scaler is None:
+                    grad_norm = nn.utils.clip_grad_norm_(self._params[name], max_norm)
+                    if not torch.isfinite(grad_norm):
+                        raise FloatingPointError(
+                            f"Non-finite gradient norm of optimizer {name!r} after {self.step} "
+                            "steps. Stopping before the optimizer update."
+                        )
+                    built.step()
+                else:
+                    if name in self.grad_clip_norm:
+                        scaler.unscale_(built)
+                        nn.utils.clip_grad_norm_(self._params[name], max_norm)
+                    scaler.step(built)
+                built.zero_grad(set_to_none=True)
+        self._window_loss[label] = self._window_loss.get(label, 0.0) + self._pending.pop(label)[0]
+        self._window_updates[label] = self._window_updates.get(label, 0) + 1
+        if scaler is not None:
+            # The scale falls exactly when the scaler skipped the step, which leaves the weights unchanged.
+            scale = scaler.get_scale()
+            scaler.update()
+            if scaler.get_scale() < scale:
+                return
+        for name in names:
+            if name in self.schedulers:
+                self.schedulers[name].step()
+        self._stepped.update(names)
+
     def evaluate(
         self,
+        *,
+        eval_step: Dict[str, EvalStepFn],
         eval_loaders: Dict[str, Iterable[Any]],
         eval_metrics: Dict[str, Dict[str, Metric]],
-        eval_step: Union[StepFn, Dict[str, StepFn]],
     ) -> Dict[str, Dict[str, Any]]:
         """
         Run every evaluation loader to exhaustion and reduce its metrics.
 
-        Runs the moving average of the weights when one is kept and the model otherwise, in
-        evaluation mode without gradients and with the buffers of the main process, gathering
-        batch results across processes so every rank computes the same value over the full
-        data. It also works on a trainer built from a checkpoint without an optimizer.
+        Each model that keeps a moving average of its weights is replaced by that average.
+        Everything runs in evaluation mode without gradients, gathering batch results across
+        processes so every rank computes the same value over the full data.
 
         Parameters
         ----------
+        eval_step : Dict[str, EvalStepFn]
+            Callable per evaluation loader, receiving the named models and one batch and
+            returning a dict forwarded to the metrics of that loader. With several processes
+            and a ``DataLoader``, every value is a tensor whose first dimension is the batch.
         eval_loaders : Dict[str, Iterable[Any]]
             Named evaluation sets, each of which must be finite.
         eval_metrics : Dict[str, Dict[str, Metric]]
             Metrics per evaluation loader, keyed the same way as ``eval_loaders``.
-        eval_step : Union[StepFn, Dict[str, StepFn]]
-            Callable receiving the model and one batch and returning a dict forwarded to
-            the metrics of that loader, or a mapping from loader name to such a callable.
 
         Returns
         -------
         eval_results : Dict[str, Dict[str, Any]]
             Mapping from loader name to its metric name and reduced value.
         """
-        model = self.ema_model if self.ema_model is not None else self.model
-        if self.ema_model is not None and self.accelerator.num_processes > 1:
-            module = self.accelerator.unwrap_model(model, keep_torch_compile=False)
-            for buffer in module.buffers():
-                broadcast(buffer, from_process=0)
-        model.eval()
+        if self.accelerator.num_processes > 1:
+            for module in self._ema_modules.values():
+                for buffer in module.buffers():
+                    broadcast(buffer, from_process=0)
+        models = {**self.models, **self.ema_models}
+        for model in models.values():
+            model.eval()
         eval_results: Dict[str, Dict[str, Any]] = {}
 
-        with torch.no_grad():
+        with torch.no_grad(), self.accelerator.autocast():
             for loader_name, eval_loader in eval_loaders.items():
-                step_fn = (
-                    eval_step.get(loader_name)
-                    if isinstance(eval_step, dict)
-                    else eval_step
-                )
-                if step_fn is None:
-                    raise ValueError(f"eval_step has no entry for loader {loader_name!r}.")
+                step_fn = eval_step[loader_name]
                 loader_metrics = eval_metrics[loader_name]
                 for metric in loader_metrics.values():
                     metric.reset()
-                if isinstance(eval_loader, DataLoader):
-                    eval_loader = self.accelerator.prepare(eval_loader)
-                for batch in eval_loader:
-                    result = step_fn(model, to_device(batch, self.device))
-                    result = self.accelerator.gather_for_metrics(result)
+                for batch in self._prepare_loader(eval_loader):
+                    result = step_fn(models, to_device(batch, self.device))
+                    # Only a DataLoader is split across processes. Any other iterable runs whole on each.
+                    if self.accelerator.num_processes > 1 and isinstance(eval_loader, DataLoader):
+                        result = self.accelerator.gather_for_metrics(result)
                     for metric in loader_metrics.values():
                         metric.update(**result)
                 eval_results[loader_name] = {
@@ -417,27 +490,30 @@ class Trainer:
             self._log(eval_results, prefix="Eval ")
         return eval_results
 
-    def _build_model(
+    def _build_models(
         self,
         config_path: Union[str, Path],
-        model_class: Type[BaseModel],
-    ) -> dict | None:
+        model_class: Dict[str, Type[BaseModel]],
+        training: bool,
+    ) -> Tuple[Dict[str, BaseModel], dict | None]:
         """
-        Construct ``self.model`` from a JSON hyper-parameter file or a checkpoint.
-
-        Both sources carry the same payload, a flat mapping passed to ``model_class`` as
-        keyword arguments. A checkpoint also stores the model class path, which is checked
-        against ``model_class`` before the model is built.
+        Construct every model on the device from a JSON hyper-parameter file or a checkpoint.
 
         Parameters
         ----------
         config_path : Union[str, Path]
             Path to a ``.json`` hyper-parameter file or a ``.pth`` checkpoint.
-        model_class : Type[BaseModel]
-            Class used to build the model, which must subclass ``BaseModel``.
+        model_class : Dict[str, Type[BaseModel]]
+            Class of each named model, which must subclass ``BaseModel``.
+        training : bool
+            Whether the trainer will train. A resumed model then takes its raw weights,
+            so that training continues from them. Otherwise it takes its moving average
+            when the checkpoint stores one.
 
         Returns
         -------
+        modules : Dict[str, BaseModel]
+            Named models on the device.
         ckpt : dict | None
             Loaded checkpoint for a ``.pth`` source, None for a ``.json`` source.
         """
@@ -447,61 +523,128 @@ class Trainer:
 
         suffix = path.suffix.lower()
         if suffix == ".json":
-            config = json.loads(path.read_text(encoding="utf-8"))
             ckpt = None
+            sources = json.loads(path.read_text(encoding="utf-8"))
         elif suffix == ".pth":
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
-            if "config" not in ckpt:
-                raise KeyError('No "config" found in checkpoint, so the model cannot be rebuilt.')
-            config = json.loads(ckpt["config"])
-            saved_name = str(ckpt["model_class"]).rsplit(".", 1)[-1]
-            if saved_name != model_class.__qualname__:
-                raise ValueError(
-                    f'Checkpoint holds model class "{saved_name}" but model_class is '
-                    f'"{model_class.__qualname__}".'
-                )
-            if self.verbose:
-                print(f'Loading config of model "{saved_name}" from checkpoint.')
-                sys.stdout.flush()
+            sources = ckpt["models"]
         else:
             raise ValueError(f"Unsupported config file type: {suffix}")
+        modules = {}
+        for name, cls in model_class.items():
+            source = sources[name]
+            if isinstance(source, str):
+                other_path, _, other_name = source.rpartition(":")
+                other = torch.load(
+                    Path(other_path).expanduser(), map_location="cpu", weights_only=False
+                )
+                module = self._entry(cls, other["models"][other_name], evaluation=True)
+            elif ckpt is not None:
+                module = self._entry(cls, source, evaluation=not training)
+            else:
+                module = cls(**source)
+            if not isinstance(module, BaseModel):
+                raise TypeError(
+                    f"{cls.__qualname__} must subclass BaseModel so its config can be "
+                    "written to the checkpoint."
+                )
+            # Checkpoints store the config as JSON, so an unserialisable one must fail here.
+            json.dumps(module.config)
+            modules[name] = module.to(self.device)
+        if ckpt is not None and self.verbose:
+            print(f"Loaded models {sorted(modules)} from checkpoint.")
+            sys.stdout.flush()
+        return modules, ckpt
 
-        self.model = model_class(**config)
-        if not isinstance(self.model, BaseModel):
-            raise TypeError(
-                f"{model_class.__qualname__} must subclass BaseModel so its "
-                "config can be written to the checkpoint."
+    @staticmethod
+    def _entry(
+        model_class: Type[BaseModel],
+        entry: dict,
+        evaluation: bool,
+    ) -> BaseModel:
+        """
+        Rebuild one model from its checkpoint entry.
+
+        Parameters
+        ----------
+        model_class : Type[BaseModel]
+            Class used to build the model, checked against the class the entry stores.
+        entry : dict
+            Entry of one model in a checkpoint, holding its class path, config, weights,
+            and moving average when one was kept.
+        evaluation : bool
+            Whether to load the weights evaluation uses, the moving average when the
+            entry stores one, instead of the raw weights.
+
+        Returns
+        -------
+        module : BaseModel
+            Model on the CPU with the chosen weights loaded.
+        """
+        saved_name = str(entry["model_class"]).rsplit(".", 1)[-1]
+        if saved_name != model_class.__name__:
+            raise ValueError(
+                f'Checkpoint holds model class "{saved_name}" but model_class is '
+                f'"{model_class.__name__}".'
             )
-        return ckpt
+        module = model_class(**json.loads(entry["config"]))
+        module.load_state_dict(
+            entry["ema"] if (evaluation and "ema" in entry) else entry["model"]
+        )
+        return module
+
+    def _build_ema(
+        self,
+        ckpt: dict | None,
+        model_class: Dict[str, Type[BaseModel]],
+    ) -> Dict[str, BaseModel]:
+        """
+        Build the moving average of every model named in ``ema_decay``.
+
+        An average starts from the one the resumed checkpoint stores, or from the current
+        weights of its model in a fresh run.
+
+        Parameters
+        ----------
+        ckpt : dict | None
+            Checkpoint returned by ``_build_models``, None for a fresh run.
+        model_class : Dict[str, Type[BaseModel]]
+            Class of each named model.
+
+        Returns
+        -------
+        ema_modules : Dict[str, BaseModel]
+            Averages on the device, without gradients and in evaluation mode.
+        """
+        ema_modules = {}
+        for name in self.ema_decay:
+            module = self._modules[name]
+            ema = model_class[name](**module.config).requires_grad_(False).eval()
+            ema.load_state_dict(
+                ckpt["models"][name]["ema"] if ckpt is not None else module.state_dict()
+            )
+            ema_modules[name] = ema.to(self.device)
+        return ema_modules
 
     def _resume_state(
         self,
         ckpt: dict,
-        optimizer: torch.optim.Optimizer | None,
-        scheduler: object | None,
     ) -> None:
         """
-        Restore weights, training progress, and optimizer state from a checkpoint.
+        Restore training progress and the state of every optimizer and scheduler.
 
         Parameters
         ----------
         ckpt : dict
-            Checkpoint returned by ``_build_model``.
-        optimizer : torch.optim.Optimizer | None
-            Optimizer before ``Accelerator.prepare``, so its key names match the file.
-        scheduler : object | None
-            Scheduler before ``Accelerator.prepare``, so its key names match the file.
+            Checkpoint returned by ``_build_models``.
         """
-        self.model.load_state_dict(ckpt["model"])
-        self.step = int(ckpt.get("step", 0))
-        self.best_metric_value = float(ckpt.get("best_metric_value", float("inf")))
-        for key, obj in (
-            ("optimizer", optimizer),
-            ("scheduler", scheduler),
-            ("scaler", self.accelerator.scaler),
-        ):
-            if key in ckpt and obj is not None:
-                obj.load_state_dict(ckpt[key])
+        self.step = int(ckpt["step"])
+        for name, built in self.optimizers.items():
+            built.load_state_dict(ckpt["optimizers"][name])
+        for name, built in self.schedulers.items():
+            built.load_state_dict(ckpt["schedulers"][name])
+        if self.accelerator.scaler is not None and "scaler" in ckpt:
+            self.accelerator.scaler.load_state_dict(ckpt["scaler"])
         if self.verbose:
             print(f"Loaded checkpoint at step {self.step}.")
             sys.stdout.flush()
@@ -511,92 +654,118 @@ class Trainer:
         filename: str,
     ) -> None:
         """
-        Write weights, model config, and training state to ``<save_dir>/<filename>.pth``.
+        Write every model and the training state to ``<save_dir>/<filename>.pth``.
 
-        All processes synchronise first and only the main one writes the file. The model and
-        its moving average are unwrapped from their distributed and compiled wrappers so the
-        stored keys match a plain module.
+        All processes synchronise before and after, and only the main one writes the file.
+        Each model is stored with its class path, config, weights, and moving average, under
+        keys that match a plain module.
 
         Parameters
         ----------
         filename : str
-            File stem without extension, such as ``"best_model"`` or ``"step_1000"``.
+            File stem without extension, such as ``"step_1000"``.
         """
         self.accelerator.wait_for_everyone()
-        if not self._is_main:
-            return
-        module = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-        ckpt = {
-            "model": module.state_dict(),
-            "config": json.dumps(module.config),
-            "model_class": f"{type(module).__module__}.{type(module).__qualname__}",
-            "step": int(self.step),
-            "best_metric_value": self.best_metric_value,
-        }
-        if self.ema_model is not None:
-            ema = self.accelerator.unwrap_model(self.ema_model, keep_torch_compile=False)
-            ckpt["ema"] = ema.state_dict()
-        for key, obj in (
-            ("optimizer", self.optimizer),
-            ("scheduler", self.scheduler),
-            ("scaler", self.accelerator.scaler),
-        ):
-            if obj is not None:
-                ckpt[key] = obj.state_dict()
-        save_path = self.save_dir / f"{filename}.pth"
-        torch.save(ckpt, save_path)
-        if self.verbose:
-            print(f"Saved training state to {save_path}")
-            sys.stdout.flush()
-
-    def _prepare_ema(
-        self,
-        ckpt: dict | None,
-        compile_model: bool,
-    ) -> nn.Module:
-        """
-        Build the moving average of the weights and prepare it for evaluation.
-
-        The average starts from the one stored in the checkpoint, or else from the prepared
-        model, whose weights every process shares.
-
-        Parameters
-        ----------
-        ckpt : dict | None
-            Checkpoint returned by ``_build_model``, None for a fresh run.
-        compile_model : bool
-            Whether to wrap the average with ``torch.compile``.
-
-        Returns
-        -------
-        ema_model : nn.Module
-            Average without gradients, prepared by the accelerator for evaluation and
-            compiled when asked.
-        """
-        module = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-        ema = type(module)(**module.config).requires_grad_(False)
-        ema.load_state_dict(
-            ckpt["ema"]
-            if ckpt is not None and "ema" in ckpt
-            else module.state_dict()
-        )
-        ema = self.accelerator.prepare_model(ema, evaluation_mode=True)
-        return torch.compile(ema) if compile_model else ema
+        if self._is_main:
+            ckpt = {
+                "models": {
+                    name: {
+                        "model": module.state_dict(),
+                        "config": json.dumps(module.config),
+                        "model_class": f"{type(module).__module__}.{type(module).__qualname__}",
+                    }
+                    for name, module in self._modules.items()
+                },
+                "optimizers": {n: built.state_dict() for n, built in self.optimizers.items()},
+                "schedulers": {n: built.state_dict() for n, built in self.schedulers.items()},
+                "step": int(self.step),
+            }
+            for name, module in self._ema_modules.items():
+                ckpt["models"][name]["ema"] = module.state_dict()
+            if self.accelerator.scaler is not None:
+                ckpt["scaler"] = self.accelerator.scaler.state_dict()
+            save_path = self.save_dir / f"{filename}.pth"
+            torch.save(ckpt, save_path)
+            if self.verbose:
+                print(f"Saved training state to {save_path}")
+                sys.stdout.flush()
+        self.accelerator.wait_for_everyone()
 
     @torch.no_grad()
     def _update_ema(
         self,
     ) -> None:
-        """Move the moving average toward the current weights and copy their buffers."""
-        module = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-        ema = self.accelerator.unwrap_model(self.ema_model, keep_torch_compile=False)
-        torch._foreach_lerp_(
-            list(ema.parameters()),
-            list(module.parameters()),
-            1.0 - self.ema_decay,
-        )
-        for ema_buffer, buffer in zip(ema.buffers(), module.buffers()):
-            ema_buffer.copy_(buffer)
+        """Move the moving average of every model this step updated toward its weights and copy its buffers."""
+        for name, ema in self._ema_modules.items():
+            if self._stepped.isdisjoint(self._owners[name]):
+                continue
+            module = self._modules[name]
+            torch._foreach_lerp_(
+                list(ema.parameters()),
+                list(module.parameters()),
+                1.0 - self.ema_decay[name],
+            )
+            for ema_buffer, buffer in zip(ema.buffers(), module.buffers()):
+                ema_buffer.copy_(buffer)
+        self._stepped.clear()
+
+    def _train_mode(
+        self,
+    ) -> None:
+        """Put every trained model in training mode and every frozen one in evaluation mode."""
+        for name, model in self.models.items():
+            model.train(name not in self._frozen)
+
+    def _prepare_loader(
+        self,
+        loader: Iterable[Any],
+    ) -> Iterable[Any]:
+        """
+        Prepare a ``DataLoader`` with the accelerator once, returning other iterables as they are.
+
+        Parameters
+        ----------
+        loader : Iterable[Any]
+            Training or evaluation iterable.
+
+        Returns
+        -------
+        prepared : Iterable[Any]
+            Prepared loader, the same object on every call with the same ``DataLoader``.
+        """
+        if not isinstance(loader, DataLoader):
+            return loader
+        if loader not in self._loaders:
+            self._loaders[loader] = self.accelerator.prepare(loader)
+        return self._loaders[loader]
+
+    @staticmethod
+    def _check(
+        kind: str,
+        names: Iterable[str],
+        known_kind: str,
+        known: Iterable[str],
+    ) -> None:
+        """
+        Raise when a mapping names something that its counterpart does not hold.
+
+        Parameters
+        ----------
+        kind : str
+            What ``names`` are, for the error message.
+        names : Iterable[str]
+            Names to check.
+        known_kind : str
+            What ``known`` are, for the error message.
+        known : Iterable[str]
+            Names that exist.
+        """
+        missing = sorted(set(names) - set(known))
+        if missing:
+            raise ValueError(
+                f"{kind} names {missing}, which {known_kind} does not hold. "
+                f"It holds {sorted(known)}."
+            )
 
     def _log(
         self,
